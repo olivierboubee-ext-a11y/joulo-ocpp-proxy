@@ -2,7 +2,10 @@ export interface Config {
   port: number;
   primaryUrl: string;
   secondaryUrls: string[];
+  keepPathPrimary: boolean;
+  keepPathSecondaries: boolean;
   logLevel: "debug" | "info" | "warn" | "error";
+  prettyLog: boolean;
 }
 
 const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;
@@ -34,10 +37,29 @@ export function loadConfig(): Config {
     );
   }
 
+  const keepPathPrimary = parseBool(process.env.KEEP_PATH_PRIMARY, false);
+  const keepPathSecondaries = parseBool(
+    process.env.KEEP_PATH_SECONDARIES,
+    false
+  );
+
+  const prettyLog = parseBool(process.env.PRETTY_LOG, false);
+
   return {
     port,
     primaryUrl,
     secondaryUrls,
+    keepPathPrimary,
+    keepPathSecondaries,
     logLevel,
+    prettyLog,
   };
+}
+
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "true") return true;
+  if (v === "false") return false;
+  return fallback;
 }

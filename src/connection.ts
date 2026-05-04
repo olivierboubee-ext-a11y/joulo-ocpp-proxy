@@ -5,8 +5,8 @@ import { OCPP_MSG_CALL, OCPP_SUBPROTOCOLS } from "./types";
 /**
  * Manages the full lifecycle of a single charger connection:
  *
- *   Charger  ←─→  Proxy  ←─→  Primary CSMS
- *                         ──→  Secondary CSMS (mirror, one-way)
+ *   Charger ←─→ Proxy ←─→ Primary CSMS
+ *                     ──→ Secondary CSMS (mirror, one-way)
  *
  * - Messages from the charger are forwarded to the primary and mirrored
  *   to all secondaries.
@@ -32,19 +32,28 @@ interface SecondaryState {
 export class ChargerConnection {
   private readonly log;
   private primary: WebSocket | null = null;
+  private primaryQueue: string[] = [];
   private secondaries: SecondaryState[] = [];
   private alive = true;
 
   constructor(
     private readonly charger: WebSocket,
     private readonly chargePointId: string,
+    private readonly fullPath: string,
     private readonly primaryUrl: string,
     private readonly secondaryUrls: string[],
+    private readonly keepPathPrimary: boolean,
+    private readonly keepPathSecondaries: boolean,
     private readonly protocol: string,
     private readonly authHeader: string | undefined
   ) {
     this.log = createLogger(chargePointId);
     this.setup();
+  }
+
+  private buildUrl(baseUrl: string, keepPath: boolean): string {
+    const suffix = keepPath ? this.fullPath : this.chargePointId;
+    return `${baseUrl.replace(/\/+$/, "")}/${suffix}`;
   }
 
   private setup() {
@@ -67,7 +76,9 @@ export class ChargerConnection {
       this.log.debug("charger → proxy", { message: this.summarise(raw) });
 
       if (this.primary?.readyState === WebSocket.OPEN) {
-        this.primary.send(raw);
+          this.primary.send(raw);
+      } else {
+          this.primaryQueue.push(raw);
       }
 
       for (const sec of this.secondaries) {
@@ -98,7 +109,6 @@ export class ChargerConnection {
     this.charger.on("ping", (data) => {
       this.primary?.ping(data);
     });
-
     this.charger.on("pong", (data) => {
       this.primary?.pong(data);
     });
@@ -117,7 +127,7 @@ export class ChargerConnection {
    * CSMS at a time).
    */
   private connectPrimary(baseUrl: string): WebSocket {
-    const url = `${baseUrl.replace(/\/+$/, "")}/${this.chargePointId}`;
+    const url = this.buildUrl(baseUrl, this.keepPathPrimary);
 
     const ws = new WebSocket(
       url,
@@ -129,7 +139,23 @@ export class ChargerConnection {
     );
 
     ws.on("open", () => {
-      this.log.info("primary connected", { url });
+      this.log.info('primary connected', { url });
+
+      if (this.primaryQueue.length > 0) {
+          this.log.info('primary flushing queued messages', {
+              count: this.primaryQueue.length,
+          });
+          for (const msg of this.primaryQueue) {
+              try {
+                  ws.send(msg);
+              } catch (err) {
+                  this.log.error('failed to flush queued message to primary', {
+                      error: (err as Error).message,
+                  });
+              }
+          }
+          this.primaryQueue = [];
+      }
     });
 
     ws.on("message", (data) => {
@@ -171,7 +197,7 @@ export class ChargerConnection {
    * connections aren't dropped by intermediaries.
    */
   private connectSecondary(state: SecondaryState): WebSocket {
-    const url = `${state.url.replace(/\/+$/, "")}/${this.chargePointId}`;
+    const url = this.buildUrl(state.url, this.keepPathSecondaries);
 
     const ws = new WebSocket(
       url,
@@ -263,12 +289,10 @@ export class ChargerConnection {
   private scheduleSecondaryReconnect(state: SecondaryState) {
     if (!this.alive) return;
     if (state.reconnectTimer !== null) return;
-
     this.log.info("secondary reconnecting", {
       url: state.url,
       delayMs: SECONDARY_RECONNECT_DELAY_MS,
     });
-
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
       if (!this.alive) return;
@@ -287,6 +311,7 @@ export class ChargerConnection {
   private teardown() {
     if (!this.alive) return;
     this.alive = false;
+    this.primaryQueue = [];
 
     for (const sec of this.secondaries) {
       this.stopSecondaryKeepalive(sec);
@@ -302,7 +327,6 @@ export class ChargerConnection {
         ws.close(1000);
       }
     };
-
     close(this.primary);
     for (const sec of this.secondaries) close(sec.ws);
     close(this.charger);
@@ -315,10 +339,8 @@ export class ChargerConnection {
     try {
       const msg = JSON.parse(raw) as unknown[];
       if (!Array.isArray(msg) || msg.length < 3) return raw.slice(0, 120);
-
       const type = msg[0] as number;
       const id = msg[1] as string;
-
       if (type === OCPP_MSG_CALL) {
         return `[CALL] ${msg[2]} (${id})`;
       }

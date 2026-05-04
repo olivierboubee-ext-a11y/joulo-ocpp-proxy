@@ -19,6 +19,7 @@ import { OCPP_MSG_CALL, OCPP_SUBPROTOCOLS } from "./types";
 
 const SECONDARY_RECONNECT_DELAY_MS = 10_000;
 const SECONDARY_KEEPALIVE_INTERVAL_MS = 30_000;
+const SECONDARY_PONG_TIMEOUT_MS = 90_000;
 const SECONDARY_MAX_QUEUE = 100;
 
 interface SecondaryState {
@@ -27,6 +28,7 @@ interface SecondaryState {
   queue: string[];
   keepalive: ReturnType<typeof setInterval> | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
+  lastPongAt: number;
 }
 
 export class ChargerConnection {
@@ -66,6 +68,7 @@ export class ChargerConnection {
         queue: [],
         keepalive: null,
         reconnectTimer: null,
+        lastPongAt: Date.now(),
       };
       this.secondaries.push(state);
       state.ws = this.connectSecondary(state);
@@ -210,15 +213,25 @@ export class ChargerConnection {
 
     ws.on("open", () => {
       this.log.info("secondary connected", { url });
+      state.lastPongAt = Date.now();
       this.flushSecondaryQueue(state, ws);
       this.startSecondaryKeepalive(state, ws);
     });
 
     ws.on("message", (data) => {
+      const raw = data.toString();
+      if (raw === "__pong__") {
+        state.lastPongAt = Date.now();
+        return;
+      }
       this.log.debug("secondary response (ignored)", {
         url,
-        message: this.summarise(data.toString()),
+        message: this.summarise(raw),
       });
+    });
+
+    ws.on("pong", () => {
+      state.lastPongAt = Date.now();
     });
 
     ws.on("close", (code, reason) => {
@@ -233,7 +246,6 @@ export class ChargerConnection {
 
     ws.on("error", (err) => {
       this.log.error("secondary error", { url, error: err.message });
-      // The "close" event will follow and trigger the reconnect.
     });
 
     return ws;
@@ -269,12 +281,20 @@ export class ChargerConnection {
   private startSecondaryKeepalive(state: SecondaryState, ws: WebSocket) {
     this.stopSecondaryKeepalive(state);
     state.keepalive = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.ping();
-        } catch {
-          /* best-effort */
-        }
+      if (ws.readyState !== WebSocket.OPEN) return;
+
+      if (Date.now() - state.lastPongAt > SECONDARY_PONG_TIMEOUT_MS) {
+        this.log.warn("secondary pong timeout, forcing reconnect", {
+          url: state.url,
+        });
+        try { ws.close(4000, "pong timeout"); } catch { /* */ }
+        return;
+      }
+
+      try {
+        ws.ping();
+      } catch {
+        /* best-effort */
       }
     }, SECONDARY_KEEPALIVE_INTERVAL_MS);
   }
